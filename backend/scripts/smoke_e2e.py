@@ -18,9 +18,19 @@ import uuid
 
 BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000").rstrip("/")
 GEMINI_KEY = (sys.argv[2] if len(sys.argv) > 2 else os.getenv("GEMINI_API_KEY", "")).strip()
+if not GEMINI_KEY:
+    # Fall back to whatever the backend itself is configured with (.env),
+    # so this proves /memory/search too without repeating the key on the CLI.
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    try:
+        from app.config import get_settings
+        GEMINI_KEY = get_settings().gemini_api_key
+    except Exception:
+        pass
 
-FILENAME = "Call_+919876543210_20260801_103000.mp3"
+FILENAME = "Call_+919876543210_20260801_103000.wav"
 SIDECAR = os.path.join("sample_audio", "Call_+919876543210_20260801_103000.txt")
+REAL_AUDIO = os.path.join("sample_audio", "Call_+919876543210_20260801_103000.wav")
 
 
 def request(method, path, body=None, headers=None, raw=None, content_type=None):
@@ -77,7 +87,13 @@ if not mongo.get("write"):
 print("    MongoDB read+write confirmed.")
 
 # 2. build a recording --------------------------------------------------------
-audio_bytes = open(SIDECAR, "rb").read() if os.path.isfile(SIDECAR) else b"fake audio bytes"
+# Prefer a real audio file (proves actual ASR, not just the stub sidecar path).
+if os.path.isfile(REAL_AUDIO):
+    audio_bytes = open(REAL_AUDIO, "rb").read()
+elif os.path.isfile(SIDECAR):
+    audio_bytes = open(SIDECAR, "rb").read()
+else:
+    audio_bytes = b"fake audio bytes"
 digest = hashlib.sha256(f"{FILENAME}:{len(audio_bytes)}:smoke".encode()).hexdigest()
 print(f"\n[2] recording {FILENAME}  hash={digest[:16]}...")
 

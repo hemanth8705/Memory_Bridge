@@ -19,7 +19,8 @@ backend/          FastAPI + MongoDB + Gemini
     config.py       env-driven settings (no secrets in code)
     db.py           Mongo connection + indexes + write-access check
     asr.py          speech-to-text DISPATCH ONLY
-    asr_provided.py <- the provided ASR implementation goes here
+    asr_provided.py adapts speech2text.py's Result to the asr.py contract
+    speech2text.py  the provided ASR implementation (faster-whisper), vendored as-is
     llm.py          Gemini prompt + structured-output schemas
     contacts.py     caller identification, contact upsert
     pipeline.py     hash -> dedupe -> identify -> ASR -> Gemini -> store
@@ -27,8 +28,10 @@ backend/          FastAPI + MongoDB + Gemini
       recordings.py /recordings/check, /recordings/process, /jobs/{id}
       contacts.py   /contacts, /contacts/{id}/memories, /memory/search
   scripts/
-    test_logic.py   pure-logic checks (no Mongo, no API key needed)
-    smoke_e2e.py    end-to-end proof against a running backend
+    test_logic.py           pure-logic checks (no Mongo, no API key needed)
+    smoke_e2e.py            end-to-end proof against a running backend
+    check_mongo.py          standalone MONGODB_URL connectivity + write check
+    check_gemini_models.py  confirms a Gemini key + which flash models it can call
 mobile/           Flutter app (Android)
   lib/
     services/config_service.dart      backend URL / Gemini key / folder
@@ -55,9 +58,25 @@ cp .env.example .env      # then edit .env
 | `MONGODB_URL` | **You supply this.** Never commit it. |
 | `MONGODB_DB` | Database name, defaults to `memorybridge`. |
 | `GEMINI_API_KEY` | Optional, local testing only — the app sends the user's own key per request. |
-| `GEMINI_MODEL` | Defaults to `gemini-2.0-flash`. |
-| `ASR_PROVIDER` | `stub` or `provided` (see below). |
+| `GEMINI_MODEL` | Defaults to `gemini-2.5-flash`. Flash tier only, by design, to keep cost down — see below. |
+| `ASR_PROVIDER` | `stub` or `provided` (see below). Defaults to `provided`. |
+| `STT_MODEL` | `tiny` \| `base` \| `small` \| `medium` \| `large-v3` \| `distil-large-v3`. Defaults to `base`. |
 | `UPLOAD_DIR` | Scratch space for uploaded audio. |
+
+### Gemini model
+
+`gemini-2.0-flash` (the earlier default) has been **retired** — the API now returns 404 for it.
+`scripts/check_gemini_models.py` checks a key against the current flash-tier lineup (lists what
+the key can see, then actually calls `generate_content` on each candidate, since listing can lag
+behind what is really callable):
+
+```bash
+.venv/Scripts/python.exe scripts/check_gemini_models.py
+```
+
+`gemini-2.5-flash` is confirmed working and is the default. We deliberately stay on the flash
+tier (never `pro`) everywhere to keep per-call cost down — that is a hard constraint, not just a
+default, so don't switch `GEMINI_MODEL` to a `pro` variant without checking cost first.
 
 ### 2. Install and run
 
@@ -99,28 +118,34 @@ confirm the recording is not reprocessed → read memories back → ask a questi
 
 ## Speech-to-text
 
-`app/asr.py` only **routes**; it never transcribes. Two providers:
+`app/asr.py` only **routes**; it never transcribes itself. Two providers:
 
-- **`stub`** (default) — no speech recognition at all. It reads a sidecar transcript so the rest
-  of the pipeline is runnable and demoable before the real ASR lands. Resolution order:
-  `<audio>.txt`, then `sample_audio/<name>.txt`, then the uploaded file if it is already text,
-  then a built-in demo transcript.
-- **`provided`** — the real implementation.
+- **`provided`** (default) — `app/speech2text.py`, vendored unmodified from the implementation
+  given for this project. [faster-whisper](https://github.com/SYSTRAN/faster-whisper) under the
+  hood: fully offline, no API key, CPU or CUDA auto-detected, decodes any common audio format
+  via bundled PyAV (no system `ffmpeg` needed). The model loads once, lazily, on first call, and
+  is reused for the rest of the process. `app/asr_provided.py` adapts its `Result` object to the
+  plain `str` that `asr.py`'s dispatcher expects — that is the entire seam.
+- **`stub`** — no speech recognition at all. Reads a sidecar transcript instead, so the rest of
+  the pipeline is runnable without any audio. Resolution order: `<audio>.txt`, then
+  `sample_audio/<name>.txt`, then the uploaded file if it is already text, then a built-in demo
+  transcript. Useful for iterating on the Gemini prompt without waiting on transcription.
 
-### Wiring in the real ASR
+Verified end-to-end on this machine: a real spoken WAV (`sample_audio/`) → `app/speech2text.py`
+→ an accurate transcript, in ~40s on CPU with the `base` model for ~40s of audio — see
+`scripts/smoke_e2e.py`.
 
-1. Paste the working implementation into `app/asr_provided.py`, exposing exactly:
+### Swapping in a different ASR implementation later
 
-   ```python
-   def transcribe(audio_path: str) -> str: ...
-   ```
+`app/asr_provided.py` only needs to keep exposing:
 
-2. Add any new packages to `requirements.txt`.
-3. Set `ASR_PROVIDER=provided` in `.env`.
+```python
+def transcribe(audio_path: str) -> str: ...
+```
 
 Nothing else changes — `pipeline.py` calls `asr.transcribe()` and does not care how the text is
 produced. It runs in a worker thread, so blocking model calls are fine; load heavy models once
-at module import.
+at module import, not per call.
 
 ---
 
@@ -219,3 +244,7 @@ Step 6 is worth showing: it is the difference between a demo and a system.
 - No authentication. Anyone with the ngrok URL can reach the API.
 - `/memory/search` sends a contact's memories to Gemini rather than doing vector retrieval.
   Fine at MVP1 volumes, and the natural place for RAG later.
+- The `base` Whisper model transcribes roughly 1:1 with audio duration on a CPU (~40s for a
+  ~40s call in testing here). A real device or a smaller phone-side CPU will be slower — that is
+  why processing is a polled background job rather than a held-open request. If a demo call runs
+  long, `STT_MODEL=tiny` trades some accuracy for speed.

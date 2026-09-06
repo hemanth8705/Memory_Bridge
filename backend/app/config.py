@@ -14,7 +14,11 @@ class Settings:
         # Optional server-side fallback. The Flutter app normally supplies the
         # user's own key per-request via the X-Gemini-Api-Key header.
         self.gemini_api_key: str = os.getenv("GEMINI_API_KEY", "").strip()
-        self.gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
+        # gemini-2.0-flash was retired (confirmed via scripts/check_gemini_models.py -
+        # the API now 404s on it). 2.5-flash is the cheapest currently-serving
+        # model confirmed to handle our structured-output extraction; stay on
+        # the flash tier (never pro) to keep per-call cost down.
+        self.gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
         self.asr_provider: str = os.getenv("ASR_PROVIDER", "stub").strip().lower()
         self.upload_dir: str = os.getenv("UPLOAD_DIR", "./uploads").strip()
         os.makedirs(self.upload_dir, exist_ok=True)
