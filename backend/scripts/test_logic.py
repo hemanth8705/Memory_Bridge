@@ -55,6 +55,22 @@ check("no timestamp in filename -> None",
 check("impossible date -> None (not a crash)",
       contacts.extract_recorded_at("X(919876543210)_20261399999999.mp3"), None)
 
+print("\n[1c] a filename timestamp must never become a phone number")
+# This actually happened: "08920474604(08920474604)_20260906134028.mp3" was
+# parsed as the number 20260906134028, creating a contact named after the
+# timestamp that held a real person's memories.
+check("14-digit timestamp is recognised as one",
+      contacts.looks_like_timestamp("20260906134028"), True)
+check("normalize_phone refuses a timestamp",
+      contacts.normalize_phone("20260906134028"), None)
+check("a real 00-prefixed international number still survives",
+      contacts.normalize_phone("00918700648603"), "8700648603")
+check("impossible date is not a timestamp, so still a number",
+      contacts.looks_like_timestamp("99999999999999"), False)
+check("the exact filename that broke resolves to the right number",
+      contacts.extract_phone_number("08920474604(08920474604)_20260906134028.mp3"),
+      "08920474604")
+
 print("\n[2] number normalisation (same person across formats)")
 keys = {contacts.normalize_phone(n) for n in
         ("+919876543210", "919876543210", "09876543210", "9876543210", "+91 98765 43210")}

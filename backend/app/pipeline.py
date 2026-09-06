@@ -134,6 +134,13 @@ async def run_pipeline(job_id: str, audio_path: str, filename: str, hash_: str,
         contact = await contacts_mod.upsert_contact(db, identity)
         contact_id = str(contact["_id"])
         display_name = contact.get("name") or "Unknown caller"
+
+        # The phone number is THE linking identifier. Stamp it onto every
+        # document we write, not just the contact row, so a caller's memories
+        # are findable by number alone - even if the contact row is missing,
+        # renamed, or split in two.
+        phone_key = identity.get("key")
+        stored_number = identity.get("phone_number")
         await _set_status(job_id, TRANSCRIBING, stage="transcribing",
                           contact_id=contact_id, contact_name=display_name)
 
@@ -147,6 +154,8 @@ async def run_pipeline(job_id: str, audio_path: str, filename: str, hash_: str,
             "filename": filename,
             "text": transcript,
             "asr_provider": asr.active_provider(),
+            "phone_key": phone_key,
+            "phone_number": stored_number,
             "recorded_at": recorded_at,
             "created_at": now,
         }
@@ -168,6 +177,8 @@ async def run_pipeline(job_id: str, audio_path: str, filename: str, hash_: str,
                 {
                     **row,
                     "contact_id": contact_id,
+                    "phone_key": phone_key,
+                    "phone_number": stored_number,
                     "source_recording": hash_,
                     "source_transcript_id": transcript_id,
                     "created_at": now,
@@ -180,6 +191,8 @@ async def run_pipeline(job_id: str, audio_path: str, filename: str, hash_: str,
             {"$set": {
                 "status": COMPLETED,
                 "contact_id": contact_id,
+                "phone_key": phone_key,
+                "phone_number": stored_number,
                 "transcript_id": transcript_id,
                 "summary": extraction.get("summary", ""),
                 "topics": extraction.get("topics", []),

@@ -53,6 +53,11 @@ async def _ensure_indexes(db: AsyncIOMotorDatabase) -> None:
     # Conversations are listed/sorted by recorded_at (actual call date), not
     # processing order - see app/pipeline.py.
     await db.recordings.create_index([("contact_id", 1), ("recorded_at", -1)])
+    # The phone number is the primary lookup key for the incoming-call popup,
+    # so it is indexed on every collection that carries it.
+    await db.memories.create_index([("phone_key", 1), ("created_at", -1)])
+    await db.recordings.create_index([("phone_key", 1), ("recorded_at", -1)])
+    await db.transcripts.create_index("phone_key")
     await db.transcripts.create_index("recording_hash")
     await db.jobs.create_index("created_at")
 

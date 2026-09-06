@@ -152,6 +152,19 @@ class MainActivity : FlutterActivity() {
 
                     "canDrawOverlays" -> result.success(canDrawOverlays())
 
+                    // Many OEM ROMs suppress the runtime dialog for call log
+                    // (it is a hard-restricted permission) but still allow it
+                    // to be switched on by hand from App info -> Permissions.
+                    "openAppSettings" -> {
+                        startActivity(
+                            Intent(
+                                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                Uri.parse("package:$packageName"),
+                            ),
+                        )
+                        result.success(true)
+                    }
+
                     "openOverlaySettings" -> {
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                             startActivity(

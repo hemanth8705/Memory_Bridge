@@ -35,6 +35,8 @@ backend/          FastAPI + MongoDB + Gemini
     check_recorded_at.py    regression test for the "last conversation" timestamp fix
     check_caller_popup.py   asserts the contract the native call popup depends on
     cleanup_test_data.py    removes the throwaway contact check_recorded_at.py creates
+    inspect_contacts.py     shows how contacts/memories are keyed (lookup diagnosis)
+    migrate_phone_keys.py   backfills phone_key + repairs timestamp-as-number contacts
 mobile/           Flutter app (Android)
   assets/icon/      logo.png (legacy icon), logo_foreground.png (padded adaptive icon)
   lib/
@@ -293,6 +295,11 @@ the card on screen.** It dismisses on ✕ or when the call ends.
 | `SYSTEM_ALERT_WINDOW` | **Yes** | Draws the card over the system call screen. |
 | `READ_CALL_LOG` | No | Since Android 9 the caller's **number** is only in that broadcast if this is granted. Without it the card still appears, as an unknown caller. |
 | Battery unrestricted | No, but | Aggressive OEM battery managers stop the receiver from firing at all. |
+
+The phone number is stamped onto every document (`contacts`, `recordings`, `transcripts`,
+`memories`), and `/callers/lookup` searches **by number first** — the contact row only supplies a
+display name. A caller's memories stay findable even if their contact row is missing, renamed or
+split. `scripts/migrate_phone_keys.py` backfills older data.
 
 `READ_CALL_LOG` is deliberately **optional**. It is a *hard-restricted* permission that some
 installers refuse to allowlist for sideloaded apps, so requiring it would leave the feature

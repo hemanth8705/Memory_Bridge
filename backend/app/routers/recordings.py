@@ -122,6 +122,11 @@ async def process_recording(
             "hash": hash,
             "filename": filename,
             "phone_number": phone_number,
+            # Stamped at upload, not just on completion, so a recording that
+            # fails processing is still reachable by number.
+            "phone_key": contacts_mod.normalize_phone(
+                phone_number or contacts_mod.extract_phone_number(filename)
+            ),
             "contact_name": contact_name,
             "recorded_at": recorded_at_dt,
             "size_bytes": size,

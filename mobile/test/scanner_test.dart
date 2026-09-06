@@ -124,6 +124,40 @@ void main() {
     });
   });
 
+  group('a filename timestamp must never become a phone number', () {
+    // This actually happened in the database: the trailing 14-digit timestamp
+    // was matched as the number, creating a contact named "20260906134028"
+    // that held a real person's memories.
+    test('the exact filename that broke resolves to the right number', () {
+      expect(
+        RecordingScanner.extractPhoneNumber(
+            '08920474604(08920474604)_20260906134028.mp3'),
+        '08920474604',
+      );
+      expect(
+        RecordingScanner.normalizePhone(
+          RecordingScanner.extractPhoneNumber(
+              '08920474604(08920474604)_20260906134028.mp3'),
+        ),
+        '8920474604',
+      );
+    });
+
+    test('a real 00-prefixed international number still survives', () {
+      // The recorder also writes 00 + country code; that is 14 digits too,
+      // but it is not a valid date so it must not be rejected.
+      expect(
+        RecordingScanner.extractPhoneNumber(
+            'Vaibhav Singh @ (00918700648603)_20260906163800.mp3'),
+        '00918700648603',
+      );
+      expect(
+        RecordingScanner.normalizePhone('00918700648603'),
+        '8700648603',
+      );
+    });
+  });
+
   group('phone-number linking is consistent across the whole chain', () {
     test('recording filename, contact list and incoming call agree', () {
       // The recorder writes 08700648603; the address book and the incoming

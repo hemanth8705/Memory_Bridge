@@ -33,6 +33,24 @@ _PHONE_RE = re.compile(r"(\+?\d[\d\s\-()]{6,17}\d)")
 # Date/time blobs that would otherwise look like phone numbers.
 _DATESTAMP_RE = re.compile(r"^(19|20)\d{6}$|^\d{6}$|^(19|20)\d{2}[-_]?\d{2}[-_]?\d{2}$")
 
+
+def looks_like_timestamp(digits: str) -> bool:
+    """True for a YYYYMMDDHHMMSS run masquerading as a phone number.
+
+    This is not hypothetical: the recorder's own filenames end in a 14-digit
+    timestamp, and a greedy phone regex will happily return it. That produced
+    a contact literally named "20260906134028" holding a real person's
+    memories, so every number is screened here before it can become an
+    identity.
+    """
+    if len(digits) != 14:
+        return False
+    try:
+        datetime.strptime(digits, "%Y%m%d%H%M%S")
+    except ValueError:
+        return False
+    return True
+
 _NOISE_WORDS = {
     "call", "calls", "recording", "recordings", "rec", "audio", "voice", "memo",
     "incoming", "outgoing", "in", "out", "new", "phone", "auto", "cube", "acr",
@@ -49,6 +67,8 @@ def normalize_phone(raw: Optional[str]) -> Optional[str]:
         return None
     digits = re.sub(r"\D", "", raw)
     if len(digits) < 7:
+        return None
+    if looks_like_timestamp(digits):
         return None
     return digits[-10:] if len(digits) >= 10 else digits
 
@@ -91,7 +111,7 @@ def extract_phone_number(filename: str) -> Optional[str]:
     for candidate in _PHONE_RE.findall(stem):
         cleaned = re.sub(r"[\s\-()]", "", candidate)
         bare = cleaned.lstrip("+")
-        if _DATESTAMP_RE.match(bare):
+        if _DATESTAMP_RE.match(bare) or looks_like_timestamp(bare):
             continue
         if len(bare) < 7 or len(bare) > 15:
             continue

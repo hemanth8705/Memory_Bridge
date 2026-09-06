@@ -223,25 +223,39 @@ async def caller_lookup(
     if not key:
         return {**base, "degraded": "unparseable_number"}
 
-    contact = await db.contacts.find_one({"phone_key": key})
-    if contact is None:
-        # Unknown caller - the popup shows the number and says so.
-        return {**base, "degraded": "contact_not_found"}
-
-    contact_id = str(contact["_id"])
-    name = contact.get("name") or raw
-    base.update({"found": True, "contact_id": contact_id, "contact_name": name})
+    # The phone number is the identifier. Everything below is found BY NUMBER
+    # first; the contact row only supplies a display name. Memories written
+    # before phone_key was stamped on them are still reachable through their
+    # contact_id, so the two are OR'd together.
+    contact_ids = [
+        str(doc["_id"])
+        async for doc in db.contacts.find({"phone_key": key}, {"_id": 1})
+    ]
+    memory_query: dict = (
+        {"$or": [{"phone_key": key}, {"contact_id": {"$in": contact_ids}}]}
+        if contact_ids
+        else {"phone_key": key}
+    )
 
     memories = []
-    async for doc in db.memories.find({"contact_id": contact_id}).sort("created_at", -1):
+    async for doc in db.memories.find(memory_query).sort("created_at", -1):
         doc.pop("_id", None)
         memories.append(doc)
 
     conversations = []
-    async for doc in db.recordings.find(
-        {"contact_id": contact_id, "status": "completed"}
-    ).sort("recorded_at", -1).limit(20):
+    recording_query = dict(memory_query)
+    recording_query["status"] = "completed"
+    async for doc in db.recordings.find(recording_query).sort("recorded_at", -1).limit(20):
         conversations.append(doc)
+
+    contact = await db.contacts.find_one({"phone_key": key})
+    if contact is None and not memories and not conversations:
+        # Genuinely unknown caller - the popup shows the number and says so.
+        return {**base, "degraded": "contact_not_found"}
+
+    contact_id = str(contact["_id"]) if contact is not None else None
+    name = (contact.get("name") if contact is not None else None) or raw
+    base.update({"found": True, "contact_id": contact_id, "contact_name": name})
 
     if not memories and not conversations:
         # Known person, nothing remembered yet.
@@ -269,5 +283,10 @@ async def caller_lookup(
     context = [c for c in (result.get("context") or []) if c and c.strip()]
     if not context:
         context = _fallback_context(ordered)
+
+    if not questions and not context:
+        # A known caller whose calls held nothing worth remembering. Say so
+        # explicitly rather than leaving the popup to infer it from emptiness.
+        return {**base, "degraded": "no_memories"}
 
     return {**base, "questions": questions[:5], "context": context[:6]}
