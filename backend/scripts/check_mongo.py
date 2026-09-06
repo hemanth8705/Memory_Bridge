@@ -15,7 +15,9 @@ async def main() -> None:
     if not settings.mongodb_url:
         print("MONGODB_URL is not set in .env")
         return
-    client = AsyncIOMotorClient(settings.mongodb_url, serverSelectionTimeoutMS=10000)
+    client = AsyncIOMotorClient(
+        settings.mongodb_url, serverSelectionTimeoutMS=10000, tz_aware=True,
+    )
     try:
         await client.admin.command("ping")
         print("PING OK")

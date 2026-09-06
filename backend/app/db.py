@@ -15,7 +15,17 @@ async def connect() -> None:
     settings = get_settings()
     if not settings.mongodb_url:
         raise RuntimeError("MONGODB_URL is not set. Copy .env.example to .env and fill it in.")
-    _client = AsyncIOMotorClient(settings.mongodb_url, serverSelectionTimeoutMS=8000)
+    # tz_aware=True is load-bearing, not cosmetic: without it, pymongo hands
+    # back naive datetimes for every timestamp in the app. FastAPI's JSON
+    # encoder then serialises those with no UTC offset, and Dart's
+    # DateTime.parse silently reinterprets an offset-less string as *local*
+    # time - skewing every "last conversation" / relative-time display by
+    # the phone's UTC offset. With this, reads round-trip as truly
+    # UTC-aware, so isoformat() always carries "+00:00" and the client
+    # parses it correctly regardless of timezone.
+    _client = AsyncIOMotorClient(
+        settings.mongodb_url, serverSelectionTimeoutMS=8000, tz_aware=True,
+    )
     _db = _client[settings.mongodb_db]
     await _client.admin.command("ping")
     await _ensure_indexes(_db)
@@ -40,6 +50,9 @@ async def _ensure_indexes(db: AsyncIOMotorDatabase) -> None:
     # unique index would reject every one after the first.
     await db.contacts.create_index("phone_key")
     await db.memories.create_index([("contact_id", 1), ("created_at", -1)])
+    # Conversations are listed/sorted by recorded_at (actual call date), not
+    # processing order - see app/pipeline.py.
+    await db.recordings.create_index([("contact_id", 1), ("recorded_at", -1)])
     await db.transcripts.create_index("recording_hash")
     await db.jobs.create_index("created_at")
 

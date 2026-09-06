@@ -14,6 +14,20 @@ from ..db import get_db
 router = APIRouter()
 
 
+def _parse_recorded_at(raw: Optional[str]) -> Optional[datetime]:
+    """The app sends the recording's own timestamp (file mtime today; a
+    filename-embedded timestamp will take priority once that format is
+    nailed down) as an ISO 8601 string. Malformed input falls back to None
+    rather than failing the whole upload."""
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
 class RecordingRef(BaseModel):
     filename: str
     hash: str
@@ -75,6 +89,11 @@ async def process_recording(
                                                pipeline.EXTRACTING):
         return {"job_id": existing.get("job_id"), "status": "in_progress", "hash": hash}
 
+    # The actual conversation date - NOT when we happen to process it. The
+    # phone sends the file's own timestamp; if that's missing or malformed,
+    # fall back to "now" rather than fail the upload over it.
+    recorded_at_dt = _parse_recorded_at(recorded_at) or datetime.now(timezone.utc)
+
     settings = get_settings()
     suffix = os.path.splitext(file.filename or filename)[1] or ".audio"
     stored_path = os.path.join(settings.upload_dir, f"{uuid.uuid4().hex}{suffix}")
@@ -96,7 +115,7 @@ async def process_recording(
             "filename": filename,
             "phone_number": phone_number,
             "contact_name": contact_name,
-            "recorded_at": recorded_at,
+            "recorded_at": recorded_at_dt,
             "size_bytes": size,
             "status": pipeline.QUEUED,
             "job_id": job_id,
@@ -108,7 +127,7 @@ async def process_recording(
 
     background_tasks.add_task(
         pipeline.run_pipeline, job_id, stored_path, filename, hash,
-        phone_number, contact_name, x_gemini_api_key,
+        phone_number, contact_name, x_gemini_api_key, recorded_at_dt,
     )
     return {"job_id": job_id, "status": pipeline.QUEUED, "hash": hash}
 

@@ -32,7 +32,10 @@ backend/          FastAPI + MongoDB + Gemini
     smoke_e2e.py            end-to-end proof against a running backend
     check_mongo.py          standalone MONGODB_URL connectivity + write check
     check_gemini_models.py  confirms a Gemini key + which flash models it can call
+    check_recorded_at.py    regression test for the "last conversation" timestamp fix
+    cleanup_test_data.py    removes the throwaway contact check_recorded_at.py creates
 mobile/           Flutter app (Android)
+  assets/icon/      logo.png (legacy icon), logo_foreground.png (padded adaptive icon)
   lib/
     services/config_service.dart      backend URL / Gemini key / folder
     services/api_service.dart         backend client + job polling
@@ -157,7 +160,63 @@ flutter pub get
 flutter run                  # or: flutter build apk --release
 ```
 
-APKs land in `build/app/outputs/flutter-apk/`.
+### App icon
+
+The launcher icon is generated from `assets/icon/logo.png` / `logo_foreground.png` (a padded
+copy for Android's adaptive-icon safe zone — see the comment in `pubspec.yaml`) via
+[flutter_launcher_icons](https://pub.dev/packages/flutter_launcher_icons). To change the logo
+later: replace those two source images, then
+
+```bash
+dart run flutter_launcher_icons
+```
+
+This regenerates every density (`mipmap-{m,h,x,xx,xxx}hdpi`) plus the adaptive-icon XML —
+nothing else needs touching.
+
+### Builds: where, which one, and why they're such different sizes
+
+All builds land in `mobile/build/app/outputs/flutter-apk/`. Real sizes measured on this repo:
+
+| Command | Output | Size | Use it for |
+| --- | --- | --- | --- |
+| `flutter build apk --debug` | `app-debug.apk` | ~155–175 MB | `flutter run` / local dev only |
+| `flutter build apk --profile` | `app-profile.apk` | ~29 MB | performance profiling (DevTools) |
+| `flutter build apk --release` | `app-release.apk` | ~52 MB | **sideloading — works on any device** |
+| `flutter build apk --release --split-per-abi` | `app-arm64-v8a-release.apk` | ~19 MB | sideloading — 64-bit ARM (virtually every phone since ~2018) |
+| ↳ same command | `app-armeabi-v7a-release.apk` | ~16 MB | older 32-bit ARM devices |
+| ↳ same command | `app-x86_64-release.apk` | ~20 MB | emulators / x86 devices |
+| `flutter build appbundle --release` | `app-release.aab` | smallest per install | **Play Store only** — not directly installable, Play delivers a ~15–20 MB slice per device |
+
+**Debug vs release, concretely:** debug bundles an unstripped, JIT-capable Flutter engine (hot
+reload needs it), keeps Dart assertions on, applies no shrinking/obfuscation, and — this is the
+big one — packs native code for **all four** CPU architectures (arm64-v8a, armeabi-v7a, x86,
+x86_64) into one APK so it runs on absolutely anything, debugger included. Release AOT-compiles
+your Dart straight to machine code per architecture, strips debug info, shrinks/obfuscates via
+R8, and tree-shakes unused assets (icon fonts here: 1.6 MB → 4 KB). None of that debug-only
+weight belongs on a phone.
+
+**Why is a 4-screen app tens of MB either way?** It mostly isn't your code. A size breakdown of
+the arm64 release build (`flutter build apk --release --analyze-size --target-platform
+android-arm64`) attributes 17.65 MB total:
+
+| Piece | Size | What it is |
+| --- | --- | --- |
+| `libflutter.so` | 11.04 MB | **The Flutter engine itself** — Skia's renderer + the Dart runtime. Fixed cost; a blank Flutter app is nearly this size already. |
+| `libapp.so` | 5.19 MB | Your actual compiled Dart — all four screens, every service, every plugin. |
+| assets | 0.65 MB | The icon PNGs, tree-shaken fonts. |
+| everything else | 0.77 MB | `classes.dex` (plugin Java/Kotlin glue), resources, manifest. |
+
+So **91% of a release build is the engine, not the app** — this is the normal, expected shape
+for any Flutter app, not something specific to MemoryBridge.
+
+**The one lever that actually matters for a smaller file: `--split-per-abi`.** The default
+`--release` build is "fat" — it bundles all three mobile architectures so it installs on any
+device without knowing which. `--split-per-abi` builds one APK per architecture instead; hand
+someone `app-arm64-v8a-release.apk` (~19 MB) rather than the ~52 MB universal one, since nearly
+every phone sold since 2018 is arm64. That is the actual, safe way to get MemoryBridge down to a
+much smaller file — there is no hidden bloat to trim out of a 4-screen app; the engine is simply
+that size.
 
 ### Setup screen
 
@@ -197,6 +256,35 @@ pass Play Store review.
    `queued → transcribing → extracting → completed`.
 6. **Store** — transcript, per-type memory rows, contact, and conversation summary all land in
    MongoDB.
+
+### "Last conversation" timestamps
+
+The timestamp shown everywhere (dashboard contact list, contact screen, conversation cards) is
+**when the call happened** (`recorded_at` — currently the recording file's own last-modified
+time, sent by the app), never when the backend happened to process it. Those two differ whenever
+a backlog of old recordings is scanned in one go — process a 3-week-old call today and it must
+still read "3 weeks ago", not "just now".
+
+Two things make that correct, in `app/pipeline.py` / `app/routers/contacts.py`:
+
+- `recorded_at` is threaded through the whole pipeline and is what gets stored on the transcript,
+  the recording, and the contact — `processed_at` / `created_at` remain separate, genuine
+  processing-time audit fields, never shown as "last conversation".
+- The contact's `last_conversation_at` is updated with Mongo's `$max`, not `$set`. A backlog scan
+  rarely processes recordings in chronological order, so processing an *older* recording after a
+  newer one must not drag the displayed date backwards. `scripts/check_recorded_at.py` is a
+  regression test for exactly this (uploads out of chronological order, asserts the date only
+  ever moves forward).
+
+Also load-bearing: the Mongo client is `tz_aware=True` (`app/db.py`). Without it, every timestamp
+the API returns loses its UTC marker in JSON, and Dart's `DateTime.parse` silently reinterprets
+an offset-less string as *local* time — skewing every relative-time display by the phone's UTC
+offset. This was a real, previously-undetected bug affecting every timestamp in the app, not only
+`last_conversation_at`.
+
+**Not yet done:** deriving `recorded_at` from a timestamp embedded in the filename itself (more
+reliable than file mtime, which drifts if a recording is later copied/synced) — pending a real
+sample filename to build the parser against, rather than guessing the date format.
 
 Collections: `recordings`, `transcripts`, `contacts`, `memories`, `jobs`.
 

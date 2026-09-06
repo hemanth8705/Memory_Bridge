@@ -116,9 +116,18 @@ def _flatten_memories(extraction: dict) -> list[dict]:
 
 async def run_pipeline(job_id: str, audio_path: str, filename: str, hash_: str,
                        phone_number: Optional[str], contact_name: Optional[str],
-                       gemini_api_key: Optional[str]) -> None:
-    """Full pipeline for one recording. Never raises - failures land on the job."""
+                       gemini_api_key: Optional[str],
+                       recorded_at: Optional[datetime] = None) -> None:
+    """Full pipeline for one recording. Never raises - failures land on the job.
+
+    recorded_at is when the CONVERSATION happened (the recording's own
+    timestamp), not when we happen to process it - those can be weeks apart
+    for a backlog scan. Everything conversation-dated uses recorded_at;
+    "created_at" / "processed_at" fields stay as genuine processing-time
+    audit stamps.
+    """
     db = get_db()
+    recorded_at = recorded_at or datetime.now(timezone.utc)
     try:
         # --- identify contact -------------------------------------------------
         identity = contacts_mod.identify(filename, phone_number, contact_name)
@@ -138,6 +147,7 @@ async def run_pipeline(job_id: str, audio_path: str, filename: str, hash_: str,
             "filename": filename,
             "text": transcript,
             "asr_provider": asr.active_provider(),
+            "recorded_at": recorded_at,
             "created_at": now,
         }
         transcript_result = await db.transcripts.insert_one(transcript_doc)
@@ -175,13 +185,19 @@ async def run_pipeline(job_id: str, audio_path: str, filename: str, hash_: str,
                 "topics": extraction.get("topics", []),
                 "emotional_context": extraction.get("emotional_context", ""),
                 "memory_count": len(rows),
+                "recorded_at": recorded_at,
                 "processed_at": now,
             }},
         )
         await db.contacts.update_one(
             {"_id": contact["_id"]},
-            {"$set": {"last_conversation_at": now},
-             "$inc": {"conversation_count": 1}},
+            {
+                # $max, not $set: a backlog scan can process recordings out of
+                # chronological order, and "last conversation" must stay the
+                # most recent CALL regardless of processing order.
+                "$max": {"last_conversation_at": recorded_at},
+                "$inc": {"conversation_count": 1},
+            },
         )
 
         await _set_status(

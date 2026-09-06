@@ -55,14 +55,17 @@ async def contact_memories(contact_id: str):
         memories.append(doc)
 
     conversations = []
+    # Chronological order of the actual calls, not the order we processed
+    # them in - those diverge whenever a backlog is scanned all at once.
     async for doc in db.recordings.find(
         {"contact_id": contact_id, "status": "completed"}
-    ).sort("processed_at", -1):
+    ).sort("recorded_at", -1):
         conversations.append({
             "hash": doc.get("hash"),
             "filename": doc.get("filename"),
             "summary": doc.get("summary", ""),
             "topics": doc.get("topics", []),
+            "recorded_at": doc.get("recorded_at"),
             "processed_at": doc.get("processed_at"),
         })
 
@@ -94,7 +97,7 @@ class SearchRequest(BaseModel):
 def _memories_block(memories: list[dict], conversations: list[dict]) -> str:
     lines = []
     for conversation in conversations:
-        when = conversation.get("processed_at")
+        when = conversation.get("recorded_at") or conversation.get("processed_at")
         stamp = when.strftime("%Y-%m-%d") if hasattr(when, "strftime") else "unknown date"
         if conversation.get("summary"):
             lines.append(f"[conversation on {stamp}] {conversation['summary']}")
@@ -134,7 +137,7 @@ async def search_memory(
     conversations = []
     async for doc in db.recordings.find(
         {"contact_id": contact_id, "status": "completed"}
-    ).sort("processed_at", -1).limit(50):
+    ).sort("recorded_at", -1).limit(50):
         conversations.append(doc)
 
     block = _memories_block(memories, conversations)
