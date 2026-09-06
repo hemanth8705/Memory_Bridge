@@ -287,14 +287,69 @@ the card on screen.** It dismisses on ✕ or when the call ends.
 
 ### Permissions, and why each is needed
 
-| Permission | Why |
-| --- | --- |
-| `READ_PHONE_STATE` | Delivers the call-state broadcast — how we know the phone is ringing. |
-| `READ_CALL_LOG` | Since Android 9 the caller's **number** is only included in that broadcast if this is also granted. Without it we know a call is happening but not who it is. |
-| `SYSTEM_ALERT_WINDOW` | Draws the card over the system call screen. |
+| Permission | Required? | Why |
+| --- | --- | --- |
+| `READ_PHONE_STATE` | **Yes** | Delivers the call-state broadcast — how we know the phone is ringing. Without it the popup can never appear. |
+| `SYSTEM_ALERT_WINDOW` | **Yes** | Draws the card over the system call screen. |
+| `READ_CALL_LOG` | No | Since Android 9 the caller's **number** is only in that broadcast if this is granted. Without it the card still appears, as an unknown caller. |
+| Battery unrestricted | No, but | Aggressive OEM battery managers stop the receiver from firing at all. |
 
-`READ_CALL_LOG` is restricted on the Play Store; this is fine for a sideloaded hackathon build,
-and is the same approach caller-ID apps use.
+`READ_CALL_LOG` is deliberately **optional**. It is a *hard-restricted* permission that some
+installers refuse to allowlist for sideloaded apps, so requiring it would leave the feature
+permanently un-enableable on those devices. Missing number → the popup opens anyway as an
+unknown caller, which is far better than silently showing nothing.
+
+### If the popup does not appear
+
+The whole chain runs while the app is backgrounded, so nothing about it is
+visible by default. Two things make it debuggable:
+
+**1. The on-device trace.** Every step writes a breadcrumb that survives the app
+being killed. Open **Call popup → Last incoming call trace**, ring the phone from
+another one, come back and press refresh. The step marked `FAIL` is where it broke:
+
+```
+──────── INCOMING CALL ────────
+OK    1. Broadcast received - state=RINGING
+OK    2. Caller number - received (13 digits)
+FAIL  3. Popup enabled check - OFF - turn on 'Show context on incoming calls'
+```
+
+**2. Bisect the chain with the two test buttons**, which isolate the parts:
+
+| Test | If it fails |
+| --- | --- |
+| **1. Test overlay only** (no call, no backend) | The overlay permission is the problem |
+| **2. Test overlay + backend lookup** | Overlay is fine; the backend URL/ngrok is the problem |
+| Both pass, but a real call shows nothing | Call *detection* is the problem — read the trace |
+
+**Most common causes, in order:**
+
+1. **The toggle is off.** The popup is opt-in and ships disabled. The switch turns
+   red when it cannot be enabled.
+2. **Battery optimisation.** Xiaomi, Oppo, Vivo and Samsung aggressively stop
+   background components; the receiver then never fires and the trace stays empty.
+   Grant "Unrestricted battery" on the Call popup screen.
+3. **Overlay permission not granted** — it is a settings-screen toggle, not a
+   dialog, so it is easy to miss.
+4. **The app has never been launched since install.** Android keeps a freshly
+   installed app in a "stopped" state where it receives no broadcasts at all.
+
+**Via adb**, everything also goes to Logcat under one tag:
+
+```bash
+# Windows: %LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe
+adb logcat -c && adb logcat -s MemoryBridge:V
+
+# Grant everything up front (call log is hard-restricted; -g handles it)
+adb install -g -r app-arm64-v8a-release.apk
+
+# Confirm what is actually granted
+adb shell dumpsys package com.memorybridge.memorybridge | grep -i "granted=true"
+
+# Simulate a ringing call without a second phone (emulator only)
+adb emu gsm call +919876543210
+```
 
 ### It never blocks the call
 

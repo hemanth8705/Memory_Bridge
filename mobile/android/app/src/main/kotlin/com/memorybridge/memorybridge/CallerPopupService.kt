@@ -38,6 +38,7 @@ class CallerPopupService : Service() {
         private const val TAG = "MB/CallerPopup"
         const val ACTION_SHOW = "com.memorybridge.SHOW_POPUP"
         const val ACTION_DISMISS = "com.memorybridge.DISMISS_POPUP"
+        const val ACTION_TEST_OVERLAY = "com.memorybridge.TEST_OVERLAY"
         const val EXTRA_NUMBER = "number"
 
         private const val CHANNEL_ID = "memorybridge_call_popup"
@@ -60,9 +61,40 @@ class CallerPopupService : Service() {
             }
             ACTION_SHOW -> {
                 val number = intent.getStringExtra(EXTRA_NUMBER).orEmpty()
+                CallDiagnostics.record(this, "6. Popup service started")
                 startForegroundSafely()
-                showLoading(number)
+                val shown = showLoading(number)
+                if (!shown) {
+                    // No window means no popup, no matter what the backend says.
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
                 worker.execute { loadBriefing(number) }
+            }
+            // ACTION_TEST_OVERLAY proves the overlay path on its own, with no
+            // call and no network involved.
+            ACTION_TEST_OVERLAY -> {
+                CallDiagnostics.startRun(this, "OVERLAY SELF-TEST")
+                startForegroundSafely()
+                if (showLoading(intent.getStringExtra(EXTRA_NUMBER).orEmpty())) {
+                    main.post {
+                        render(
+                            Briefing(
+                                displayName = "Overlay self-test",
+                                questions = listOf(
+                                    "If you can read this, the overlay works.",
+                                    "Call detection is the remaining step.",
+                                ),
+                                contextLines = listOf(
+                                    "No call was involved",
+                                    "No backend was contacted",
+                                ),
+                            ),
+                        )
+                    }
+                } else {
+                    stopSelf()
+                }
             }
             else -> stopSelf()
         }
@@ -89,24 +121,38 @@ class CallerPopupService : Service() {
                 .setOngoing(true)
                 .build()
             startForeground(NOTIFICATION_ID, notification)
+            CallDiagnostics.record(this, "7. Foreground service active")
         } catch (t: Throwable) {
-            // A suppressed notification must not take the popup down with it.
-            Log.w(TAG, "Could not enter foreground: ${t.message}")
+            // The overlay is added via WindowManager and does not depend on the
+            // service being foreground, so a failure here is recorded but not
+            // fatal - the popup can still be drawn.
+            CallDiagnostics.record(
+                this,
+                "7. Foreground service",
+                "${t.javaClass.simpleName}: ${t.message} (popup can still draw)",
+                ok = false,
+            )
         }
     }
 
     // --- overlay ------------------------------------------------------------
 
-    private fun showLoading(number: String) {
-        val view = ensureOverlay() ?: return
+    /** Returns false if the overlay window could not be created at all. */
+    private fun showLoading(number: String): Boolean {
+        val view = ensureOverlay() ?: return false
         view.findViewById<TextView>(R.id.caller_name).text =
             if (number.isBlank()) "Incoming call" else number
         view.findViewById<TextView>(R.id.caller_subtitle).apply {
-            text = "Looking up what you remember…"
+            text = if (number.isBlank()) {
+                "Number unavailable — looking up anyway…"
+            } else {
+                "Looking up what you remember…"
+            }
             visibility = View.VISIBLE
         }
         view.findViewById<View>(R.id.questions_section).visibility = View.GONE
         view.findViewById<View>(R.id.context_section).visibility = View.GONE
+        return true
     }
 
     private fun ensureOverlay(): View? {
@@ -143,8 +189,15 @@ class CallerPopupService : Service() {
             manager.addView(view, params)
             windowManager = manager
             overlay = view
+            CallDiagnostics.record(this, "8. Overlay window created - popup is on screen")
             view
         } catch (t: Throwable) {
+            CallDiagnostics.record(
+                this,
+                "8. Overlay window",
+                "${t.javaClass.simpleName}: ${t.message}",
+                ok = false,
+            )
             Log.e(TAG, "Could not add overlay", t)
             null
         }
@@ -164,10 +217,25 @@ class CallerPopupService : Service() {
 
     private fun loadBriefing(number: String) {
         val result = try {
-            fetch(number)
+            val briefing = fetch(number)
+            CallDiagnostics.record(
+                this,
+                "9. Backend lookup",
+                "${briefing.questions.size} questions, ${briefing.contextLines.size} context lines",
+            )
+            briefing
         } catch (t: Throwable) {
+            CallDiagnostics.record(
+                this,
+                "9. Backend lookup",
+                "${t.javaClass.simpleName}: ${t.message} (popup stays up)",
+                ok = false,
+            )
             Log.w(TAG, "Lookup failed", t)
-            Briefing(displayName = number, note = noteForError(t))
+            Briefing(
+                displayName = number.ifBlank { "Unknown caller" },
+                note = noteForError(t),
+            )
         }
         main.post { render(result) }
     }
@@ -221,9 +289,10 @@ class CallerPopupService : Service() {
     }
 
     private fun parse(number: String, json: JSONObject): Briefing {
+        // org.json turns a JSON null into the literal string "null".
         val name = json.optString("contact_name").takeIf {
             it.isNotEmpty() && it != "null"
-        } ?: number
+        } ?: number.ifBlank { "Unknown caller" }
 
         val questions = json.optJSONArray("questions").toStringList()
         val contextLines = json.optJSONArray("context").toStringList()
@@ -233,6 +302,10 @@ class CallerPopupService : Service() {
                 "Unknown contact\nNo relationship context available."
             json.optString("degraded") == "no_memories" ->
                 "No previous memories found.\nStart a conversation naturally."
+            json.optString("degraded") == "unparseable_number" &&
+                number.isBlank() ->
+                "Android did not provide the caller's number.\n" +
+                    "Grant the call-log permission to identify callers."
             json.optString("degraded") == "unparseable_number" ->
                 "No caller number available."
             json.optString("degraded") == "llm_unavailable" && contextLines.isEmpty() ->

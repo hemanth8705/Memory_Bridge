@@ -4,6 +4,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
 import android.provider.Settings
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -28,8 +29,24 @@ class MainActivity : FlutterActivity() {
 
     private var pendingPermissionResult: MethodChannel.Result? = null
 
-    private fun hasCallPermissions(): Boolean = CALL_PERMISSIONS.all {
-        ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
+    private fun granted(permission: String): Boolean =
+        ContextCompat.checkSelfPermission(this, permission) ==
+            PackageManager.PERMISSION_GRANTED
+
+    /**
+     * Only READ_PHONE_STATE is required. READ_CALL_LOG is a hard-restricted
+     * permission that some installers refuse to allowlist; without it the
+     * popup still appears, just without the caller's number, so it must not
+     * gate the feature.
+     */
+    private fun hasCallPermissions(): Boolean =
+        granted(android.Manifest.permission.READ_PHONE_STATE)
+
+    private fun isIgnoringBatteryOptimizations(): Boolean = try {
+        val manager = getSystemService(PowerManager::class.java)
+        manager?.isIgnoringBatteryOptimizations(packageName) ?: false
+    } catch (t: Throwable) {
+        false
     }
 
     private fun canDrawOverlays(): Boolean =
@@ -42,9 +59,10 @@ class MainActivity : FlutterActivity() {
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode != CALL_PERMISSION_REQUEST) return
-        val granted = grantResults.isNotEmpty() &&
-            grantResults.all { it == PackageManager.PERMISSION_GRANTED }
-        pendingPermissionResult?.success(granted)
+        // Success means READ_PHONE_STATE landed. READ_CALL_LOG is a bonus: on
+        // devices where it cannot be granted, requiring it here would leave the
+        // feature permanently un-enableable.
+        pendingPermissionResult?.success(hasCallPermissions())
         pendingPermissionResult = null
     }
 
@@ -71,6 +89,55 @@ class MainActivity : FlutterActivity() {
                         result.success(NativeConfig.popupEnabled(applicationContext))
 
                     "hasCallPermissions" -> result.success(hasCallPermissions())
+
+                    // Reported separately: phone state is required for the
+                    // popup to work at all, call log only adds the number.
+                    "permissionDetail" -> result.success(
+                        mapOf(
+                            "phone_state" to granted(android.Manifest.permission.READ_PHONE_STATE),
+                            "call_log" to granted(android.Manifest.permission.READ_CALL_LOG),
+                            "overlay" to canDrawOverlays(),
+                            "battery_unrestricted" to isIgnoringBatteryOptimizations(),
+                        ),
+                    )
+
+                    "getDiagnostics" ->
+                        result.success(CallDiagnostics.read(applicationContext))
+
+                    "clearDiagnostics" -> {
+                        CallDiagnostics.clear(applicationContext)
+                        result.success(true)
+                    }
+
+                    "openBatterySettings" -> {
+                        try {
+                            startActivity(
+                                Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS),
+                            )
+                        } catch (t: Throwable) {
+                            startActivity(
+                                Intent(
+                                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                    Uri.parse("package:$packageName"),
+                                ),
+                            )
+                        }
+                        result.success(true)
+                    }
+
+                    // Draws the card with canned content: proves the overlay
+                    // path works without a call or the backend.
+                    "testOverlay" -> {
+                        val intent = Intent(this, CallerPopupService::class.java).apply {
+                            action = CallerPopupService.ACTION_TEST_OVERLAY
+                        }
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            startForegroundService(intent)
+                        } else {
+                            startService(intent)
+                        }
+                        result.success(true)
+                    }
 
                     "requestCallPermissions" -> {
                         if (hasCallPermissions()) {
