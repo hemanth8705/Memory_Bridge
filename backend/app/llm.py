@@ -154,27 +154,51 @@ def resolve_api_key(supplied: Optional[str]) -> str:
 
 
 def _generate(api_key: str, prompt: str, schema: dict, system: str) -> dict:
-    from google import genai
-    from google.genai import types
+    """Call Gemini and return parsed JSON.
 
-    client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=get_settings().gemini_model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=system,
-            response_mime_type="application/json",
-            response_schema=schema,
-            temperature=0.2,
-        ),
-    )
-    text = (response.text or "").strip()
-    if not text:
-        raise LLMError("Gemini returned an empty response.")
+    Every failure mode - bad key, quota, network, safety block, truncated or
+    non-JSON output - surfaces as LLMError so callers have one thing to catch.
+    """
     try:
-        return json.loads(text)
+        from google import genai
+        from google.genai import types
+    except ImportError as exc:
+        raise LLMError(f"google-genai is not installed: {exc}") from exc
+
+    model = get_settings().gemini_model
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                response_mime_type="application/json",
+                response_schema=schema,
+                temperature=0.2,
+            ),
+        )
+    except Exception as exc:
+        raise LLMError(f"{type(exc).__name__} calling {model}: {exc}") from exc
+
+    try:
+        text = (response.text or "").strip()
+    except Exception as exc:
+        # A response blocked by a safety filter has no .text at all.
+        raise LLMError(f"{model} returned no usable content: {exc}") from exc
+
+    if not text:
+        raise LLMError(f"{model} returned an empty response.")
+    try:
+        parsed = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise LLMError(f"Gemini returned non-JSON output: {text[:400]}") from exc
+        raise LLMError(f"{model} returned non-JSON output: {text[:400]}") from exc
+
+    if not isinstance(parsed, dict):
+        raise LLMError(
+            f"{model} returned {type(parsed).__name__}, expected a JSON object."
+        )
+    return parsed
 
 
 def extract_memories(transcript: str, contact_name: str, api_key: Optional[str]) -> dict:

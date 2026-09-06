@@ -47,21 +47,44 @@ async def check_recordings(payload: CheckRequest):
         return {"new": [], "already_processed": [], "in_progress": []}
 
     known = {}
-    async for doc in db.recordings.find({"hash": {"$in": hashes}}, {"hash": 1, "status": 1}):
-        known[doc["hash"]] = doc.get("status", "unknown")
+    async for doc in db.recordings.find(
+        {"hash": {"$in": hashes}}, {"hash": 1, "status": 1, "attempts": 1}
+    ):
+        known[doc["hash"]] = doc
 
-    new, done, in_progress = [], [], []
+    new, done, in_progress, skipped = [], [], [], []
     for ref in payload.recordings:
-        status = known.get(ref.hash)
+        doc = known.get(ref.hash)
+        status = doc.get("status") if doc else None
+        attempts = (doc or {}).get("attempts", 0)
         item = {"filename": ref.filename, "hash": ref.hash}
-        if status is None or status == pipeline.FAILED:
-            new.append(item)          # never seen, or a previous attempt failed - retry
-        elif status == pipeline.COMPLETED:
-            done.append(item)
+
+        if status is None:
+            new.append(item)                       # never seen
+        elif status in pipeline.TERMINAL_STATUSES:
+            # Completed, or processed and found to contain no speech. Either
+            # way it is done: re-offering a silent recording would re-upload
+            # and re-transcribe it on every single scan, forever.
+            (done if status == pipeline.COMPLETED else skipped).append(
+                {**item, "reason": status}
+            )
+        elif status == pipeline.FAILED:
+            if attempts >= pipeline.MAX_ATTEMPTS:
+                skipped.append({**item, "reason": "too_many_failures",
+                                "attempts": attempts})
+            else:
+                new.append(item)                   # a real failure - worth a retry
         else:
             in_progress.append(item)
 
-    return {"new": new, "already_processed": done, "in_progress": in_progress}
+    return {
+        "new": new,
+        "already_processed": done,
+        "in_progress": in_progress,
+        # Deliberately not retried. Surfaced so the app can explain itself
+        # rather than silently dropping these.
+        "skipped": skipped,
+    }
 
 
 @router.post("/recordings/process")

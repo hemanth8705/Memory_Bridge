@@ -6,7 +6,8 @@ it — helping you remember, reconnect, and have more meaningful conversations.
 
 **MVP1 flow:** phone call recording → watched folder → caller identified from filename +
 contacts → uploaded to the backend → speech-to-text → transcript in MongoDB → Gemini extracts
-structured relationship memories → Flutter shows them, and answers questions about the person.
+structured relationship memories → **embedded into Actian VectorAI DB** → Flutter shows them,
+and answers questions about the person from **semantically retrieved** context.
 
 ---
 
@@ -22,8 +23,10 @@ backend/          FastAPI + MongoDB + Gemini
     asr_provided.py adapts speech2text.py's Result to the asr.py contract
     speech2text.py  the provided ASR implementation (faster-whisper), vendored as-is
     llm.py          Gemini prompt + structured-output schemas
+    embeddings.py   text -> vectors (Gemini embeddings, task-typed + normalised)
+    vectordb.py     Actian VectorAI DB driver: index on write, retrieve on read
     contacts.py     caller identification, contact upsert
-    pipeline.py     hash -> dedupe -> identify -> ASR -> Gemini -> store
+    pipeline.py     hash -> dedupe -> identify -> ASR -> Gemini -> store -> index
     routers/
       recordings.py /recordings/check, /recordings/process, /jobs/{id}
       contacts.py   /contacts, /contacts/{id}/memories, /memory/search
@@ -34,9 +37,14 @@ backend/          FastAPI + MongoDB + Gemini
     check_gemini_models.py  confirms a Gemini key + which flash models it can call
     check_recorded_at.py    regression test for the "last conversation" timestamp fix
     check_caller_popup.py   asserts the contract the native call popup depends on
+    test_error_handling.py  failure-path checks (no Mongo, no API key needed)
+    check_silent_recording.py  live check that a silent recording is not retried forever
     cleanup_test_data.py    removes the throwaway contact check_recorded_at.py creates
     inspect_contacts.py     shows how contacts/memories are keyed (lookup diagnosis)
     migrate_phone_keys.py   backfills phone_key + repairs timestamp-as-number contacts
+    check_vectordb.py       proves the vector layer end to end, with scores
+    reindex_vectordb.py     backfills existing Mongo memories into the vector DB
+    test_vectordb.py        vector-layer checks incl. the post-filter regression guard
 mobile/           Flutter app (Android)
   assets/icon/      logo.png (legacy icon), logo_foreground.png (padded adaptive icon)
   lib/
@@ -77,6 +85,12 @@ cp .env.example .env      # then edit .env
 | `ASR_PROVIDER` | `stub` or `provided` (see below). Defaults to `provided`. |
 | `STT_MODEL` | `tiny` \| `base` \| `small` \| `medium` \| `large-v3` \| `distil-large-v3`. Defaults to `base`. |
 | `UPLOAD_DIR` | Scratch space for uploaded audio. |
+| `VECTOR_DB_ENABLED` | Defaults to `true`. `false` runs MongoDB-only. |
+| `VECTOR_DB_URL` | Actian VectorAI DB gRPC address, defaults to `localhost:6574`. |
+| `VECTOR_DB_COLLECTION` | Defaults to `memorybridge_memories`. |
+| `EMBEDDING_MODEL` / `EMBEDDING_DIM` | Defaults to `gemini-embedding-001` at 768 dims. Changing either means recreating the collection. |
+
+See [Semantic memory](#semantic-memory-actian-vectorai-db) for the vector DB itself.
 
 ### Gemini model
 
@@ -420,6 +434,10 @@ lines, and is instructed to return fewer rather than pad.
    `queued → transcribing → extracting → completed`.
 6. **Store** — transcript, per-type memory rows, contact, and conversation summary all land in
    MongoDB.
+7. **Index** — the same memories and the conversation summary are embedded and upserted into
+   **Actian VectorAI DB**, so step 8 can retrieve by meaning.
+8. **Retrieve** — when the user asks a question, or a call comes in, the context handed to
+   Gemini is the semantically nearest material, not the most recent rows. See below.
 
 ### "Last conversation" timestamps
 
@@ -454,19 +472,111 @@ Collections: `recordings`, `transcripts`, `contacts`, `memories`, `jobs`.
 
 ---
 
+## Semantic memory: Actian VectorAI DB
+
+MongoDB remains the system of record. The vector DB is an **index over it**, added as two
+layers — one on write, one on read.
+
+```
+WRITE  app/pipeline.py      memories + summary ──embed──▶ VectorAI DB   (alongside the Mongo write)
+READ   app/routers/contacts.py   question ──embed──▶ similarity search ──▶ context ──▶ Gemini
+```
+
+### Why it is worth having
+
+Without it, "context" meant *the most recent N memory rows*, and the model had to find the
+relevant part itself. With it, the question decides what the model reads. Asked
+`"is anyone in his family unwell right now?"` — wording that appears nowhere in the stored
+memories:
+
+```
+0.7349  [health]         Rahul's mom is having surgery on Monday.
+0.7133  [family]         mother: surgery (Monday)
+0.6877  [important_date] Rahul's mom's surgery - Monday
+0.6788  [follow_up]      Ask Rahul how his mom's surgery went.
+...
+0.5531  [follow_up]      Remind Rahul about the React course.
+```
+
+The MongoDB path reaches the same rows but orders them by recency, putting *"joining
+Microsoft"* first. Both answer this question; only one scales past the point where a person's
+memories stop fitting in a prompt.
+
+### How it is wired
+
+- **Embeddings** (`app/embeddings.py`) come from Gemini — the app already carries a Gemini key,
+  so there is no second credential and no local model to download. Stored memories are embedded
+  as `RETRIEVAL_DOCUMENT` and questions as `RETRIEVAL_QUERY`; that asymmetry is what makes a
+  question match a statement. Vectors are 768-dim and normalised (`gemini-embedding-001` is
+  Matryoshka — truncated sizes come back un-normalised).
+- **Point IDs** are deterministic UUID5s of the Mongo `_id`, and a recording's existing points
+  are cleared before re-indexing, so re-processing converges instead of duplicating.
+- **Retrieval** is `retrieve_context()` in `app/routers/contacts.py`, used by both
+  `POST /memory/search` (query = the user's question) and `POST /callers/lookup` (query = a
+  standing briefing question, since the phone ringing asks nothing specific).
+- Every response reports which layer answered, as `"retrieval": "vector" | "mongodb"`.
+
+### It degrades, it does not break
+
+The phone rings for ~25 seconds; a vector DB being down must never cost the user an answer.
+Container unreachable, Gemini key missing, nothing indexed for this contact yet — each returns
+`source = None`, and the caller falls back to the MongoDB path. Nothing raises, nothing 500s.
+Verified: pointing `VECTOR_DB_URL` at a dead port still answers both endpoints correctly, with
+`"retrieval": "mongodb"` and the reason in `retrieval_error`.
+
+### A trap worth knowing about
+
+**The server post-filters.** A payload filter is applied *after* the top-`limit` candidates are
+taken by vector similarity — not during the search. So a search scoped to one contact, asked
+naively with `limit=3`, returns whichever of the global top 3 happen to belong to them, which is
+routinely **zero rows, with no error**. Measured on 1.0.2, for a contact holding 13 of the
+collection's 31 points:
+
+| `limit` | 3 | 5 | 10 | 20 | 31 |
+| --- | --- | --- | --- | --- | --- |
+| rows returned | 0 | 0 | 1 | 12 | 13 |
+
+`app/vectordb.py` therefore over-fetches a wide window and trims client-side.
+`scripts/test_vectordb.py` guards it against regression, since the failure mode is silent.
+
+### Running it
+
+```powershell
+mkdir local_data
+docker run -d --name vectorai `
+  -v "${PWD}\local_data:/var/lib/actian-vectorai" `
+  -p 6573-6575:6573-6575 `
+  -e "ACTIAN_VECTORAI_ACCEPT_EULA=YES" `
+  actian/vectorai:latest
+```
+
+Then, from `backend/`:
+
+```powershell
+python scripts/reindex_vectordb.py   # backfill memories written before this layer existed
+python scripts/check_vectordb.py     # prove it end to end, with scores
+python scripts/test_vectordb.py      # the checks, including the post-filter guard
+```
+
+`GET /health` reports the collection, dimension, server version and live point count;
+`GET /stats` reports `indexed_vectors`. Set `VECTOR_DB_ENABLED=false` to switch the layer off
+entirely and run MongoDB-only.
+
+---
+
 ## API
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /health` | Mongo connectivity + write access + active ASR provider |
-| `GET /stats` | Dashboard counters |
+| `GET /health` | Mongo connectivity + write access + active ASR provider + vector DB status |
+| `GET /stats` | Dashboard counters, including `indexed_vectors` |
 | `POST /recordings/check` | `{recordings:[{filename,hash}]}` → what still needs processing |
 | `POST /recordings/process` | Multipart upload → `{job_id}` |
 | `GET /jobs/{job_id}` | Job status, and results once completed |
 | `GET /contacts` | People, most recently spoken to first |
 | `GET /contacts/{id}/memories` | Memories grouped by type, topics, conversations |
-| `POST /memory/search` | `{contact_id, query}` → grounded answer + suggested questions |
-| `POST /callers/lookup` | `{phone_number}` → `{contact_name, questions[], context[], degraded}` for the incoming-call popup. One round trip, because the phone only rings for ~25s. |
+| `POST /memory/search` | `{contact_id, query}` → grounded answer + suggested questions, plus `retrieval` and the scored `matches` that produced it |
+| `POST /callers/lookup` | `{phone_number}` → `{contact_name, questions[], context[], degraded, retrieval}` for the incoming-call popup. One round trip, because the phone only rings for ~25s. |
 
 The Gemini key travels on the `X-Gemini-Api-Key` header for the two endpoints that need it.
 
@@ -493,6 +603,38 @@ Step 6 is worth showing: it is the difference between a demo and a system.
 
 - Background jobs live in the FastAPI process. Restarting the server abandons in-flight jobs;
   the recording is retried on the next scan because failed rows are re-offered.
+
+### How processing failures are handled
+
+A recording ends in one of three states, and the difference matters because
+`/recordings/check` decides what to re-offer:
+
+| Status | Meaning | Retried? |
+| --- | --- | --- |
+| `completed` | Transcribed and extracted | No |
+| `no_speech` | Processed fine, but there was nothing to transcribe — silence, a pocket dial, a missed call | **No** — it would produce the same empty result forever |
+| `failed` | A real error: backend down, model crash, Gemini error | Yes, up to `MAX_ATTEMPTS` (3) |
+
+`no_speech` is the important one. It used to be `failed`, which meant a silent
+recording was re-uploaded and re-transcribed on **every single scan**, burning
+~40s of Whisper CPU each time and sitting permanently in the "New" count.
+
+Other guarantees:
+
+- **A retry never re-transcribes.** The transcript is upserted on the recording
+  hash, so if Gemini fails after ASR succeeded, the retry reuses the transcript
+  and only re-runs the model.
+- **Malformed model output cannot destroy a transcription.** `_flatten_memories`
+  skips anything that is not the shape it expects rather than raising — by then
+  the expensive work is already done.
+- **A vector-DB failure never fails a recording.** Mongo is the system of record.
+- **Status writes never raise.** `_set_status` / `_fail` swallow their own errors,
+  so a dropped connection cannot mask the original failure or strand a job the
+  app is polling.
+
+`scripts/test_error_handling.py` covers these paths with no Mongo or API key
+needed; `scripts/check_silent_recording.py` reproduces the original bug end to
+end against a running backend.
 - Periodic hourly scanning is not implemented — manual **Scan & Process** is the supported path.
 - No authentication. Anyone with the ngrok URL can reach the API.
 - `/memory/search` sends a contact's memories to Gemini rather than doing vector retrieval.

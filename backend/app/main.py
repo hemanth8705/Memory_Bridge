@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from . import asr, db
+from . import asr, db, vectordb
 from .config import get_settings
 from .routers import contacts as contacts_router, recordings as recordings_router
 
@@ -26,7 +26,11 @@ async def lifespan(app: FastAPI):
         # Keep the server up so /health can explain what is wrong.
         _startup_error = str(exc)
         log.error("MongoDB connection failed: %s", exc)
+    # Opens the gRPC channel and creates the collection if it is missing.
+    # Never raises: without it the app falls back to MongoDB-only retrieval.
+    await vectordb.connect()
     yield
+    await vectordb.close()
     await db.close()
 
 
@@ -53,6 +57,7 @@ async def health():
         "asr_provider": asr.active_provider(),
         "gemini_model": settings.gemini_model,
         "mongodb": {"connected": False, "database": settings.mongodb_db},
+        "vector_db": await vectordb.status(),
     }
     if _startup_error:
         payload["status"] = "degraded"
@@ -71,10 +76,26 @@ async def health():
 
 @app.get("/stats")
 async def stats():
-    """Numbers for the dashboard."""
-    database = db.get_db()
-    return {
-        "processed_recordings": await database.recordings.count_documents({"status": "completed"}),
-        "contacts": await database.contacts.count_documents({}),
-        "memories": await database.memories.count_documents({}),
-    }
+    """Numbers for the dashboard.
+
+    Returns zeros with an error rather than a 500 when Mongo is unreachable -
+    the dashboard should still render and say what is wrong.
+    """
+    try:
+        database = db.get_db()
+    except Exception as exc:
+        return {"processed_recordings": 0, "contacts": 0, "memories": 0,
+                "indexed_vectors": None, "error": str(exc)}
+    try:
+        return {
+            "processed_recordings": await database.recordings.count_documents({"status": "completed"}),
+            "contacts": await database.contacts.count_documents({}),
+            "memories": await database.memories.count_documents({}),
+            # Points held in the Actian VectorAI DB: one per memory, plus one
+            # per conversation summary. None when the layer is unavailable.
+            "indexed_vectors": await vectordb.count_for(),
+        }
+    except Exception as exc:
+        log.warning("Could not read stats: %s", exc)
+        return {"processed_recordings": 0, "contacts": 0, "memories": 0,
+                "indexed_vectors": None, "error": str(exc)}

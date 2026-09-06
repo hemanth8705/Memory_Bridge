@@ -34,6 +34,16 @@ class ASRUnavailable(RuntimeError):
     """Raised when the selected provider cannot run."""
 
 
+class ASREmptyTranscript(ASRUnavailable):
+    """The audio was processed fine, but contained no speech.
+
+    Distinct from ASRUnavailable on purpose: this is an *outcome*, not an
+    error. A silent or music-only recording will produce the same empty result
+    every single time, so the pipeline marks it terminal instead of queueing it
+    for a retry that can never succeed.
+    """
+
+
 def _stub_transcribe(audio_path: str) -> str:
     """Read a sidecar transcript instead of doing real ASR.
 
@@ -89,7 +99,28 @@ def transcribe(audio_path: str) -> str:
         )
     if not os.path.isfile(audio_path):
         raise ASRUnavailable(f"Audio file not found: {audio_path}")
-    text = (fn(audio_path) or "").strip()
+    try:
+        size = os.path.getsize(audio_path)
+    except OSError as exc:
+        raise ASRUnavailable(f"Audio file is unreadable: {exc}") from exc
+    if size == 0:
+        raise ASREmptyTranscript("Audio file is empty (0 bytes).")
+
+    try:
+        raw = fn(audio_path)
+    except ASRUnavailable:
+        raise
+    except Exception as exc:
+        # Anything the engine throws - a corrupt container, an unsupported
+        # codec, a model that failed to load - becomes one exception type the
+        # pipeline can reason about, with the original attached.
+        raise ASRUnavailable(
+            f"{type(exc).__name__} while transcribing {os.path.basename(audio_path)}: {exc}"
+        ) from exc
+
+    text = (raw or "").strip()
     if not text:
-        raise ASRUnavailable("ASR returned an empty transcript.")
+        raise ASREmptyTranscript(
+            "No speech detected in the recording (silence, or too short)."
+        )
     return text
