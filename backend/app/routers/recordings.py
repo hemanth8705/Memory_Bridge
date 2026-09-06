@@ -7,7 +7,7 @@ from typing import Optional
 from fastapi import APIRouter, BackgroundTasks, File, Form, Header, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-from .. import pipeline
+from .. import contacts as contacts_mod, pipeline
 from ..config import get_settings
 from ..db import get_db
 
@@ -15,10 +15,11 @@ router = APIRouter()
 
 
 def _parse_recorded_at(raw: Optional[str]) -> Optional[datetime]:
-    """The app sends the recording's own timestamp (file mtime today; a
-    filename-embedded timestamp will take priority once that format is
-    nailed down) as an ISO 8601 string. Malformed input falls back to None
-    rather than failing the whole upload."""
+    """Parse the file-mtime timestamp the app sends, as ISO 8601.
+
+    This is the second-choice source: a timestamp embedded in the filename
+    wins when present (see contacts.extract_recorded_at). Malformed input
+    returns None rather than failing the whole upload."""
     if not raw:
         return None
     try:
@@ -89,10 +90,17 @@ async def process_recording(
                                                pipeline.EXTRACTING):
         return {"job_id": existing.get("job_id"), "status": "in_progress", "hash": hash}
 
-    # The actual conversation date - NOT when we happen to process it. The
-    # phone sends the file's own timestamp; if that's missing or malformed,
-    # fall back to "now" rather than fail the upload over it.
-    recorded_at_dt = _parse_recorded_at(recorded_at) or datetime.now(timezone.utc)
+    # The actual conversation date - NOT when we happen to process it.
+    # Preference order, most trustworthy first:
+    #   1. a timestamp embedded in the filename by the recorder itself
+    #      (survives the file being copied or synced),
+    #   2. the file mtime the phone sent,
+    #   3. now, rather than failing the upload over a missing date.
+    recorded_at_dt = (
+        contacts_mod.extract_recorded_at(filename)
+        or _parse_recorded_at(recorded_at)
+        or datetime.now(timezone.utc)
+    )
 
     settings = get_settings()
     suffix = os.path.splitext(file.filename or filename)[1] or ".audio"

@@ -12,6 +12,17 @@
     <!-- Resolve a caller's phone number to a name. -->
     <uses-permission android:name="android.permission.READ_CONTACTS"/>
 
+    <!-- Incoming-call context popup.
+         READ_PHONE_STATE delivers the call-state broadcast; since Android 9 the
+         caller's NUMBER is only included in it if we also hold READ_CALL_LOG.
+         SYSTEM_ALERT_WINDOW lets the card float over the system call screen. -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE"/>
+    <uses-permission android:name="android.permission.READ_CALL_LOG"/>
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+
     <application
         android:label="MemoryBridge"
         android:name="${applicationName}"
@@ -40,6 +51,29 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <!-- Incoming-call detection. Manifest-registered so it still fires when
+             the app is backgrounded or has been killed. -->
+        <receiver
+            android:name=".CallReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter android:priority="1000">
+                <action android:name="android.intent.action.PHONE_STATE" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Hosts the overlay card. "specialUse" because this is a caller-context
+             overlay rather than an actual calling/media/location service. -->
+        <service
+            android:name=".CallerPopupService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Displays relationship context over the incoming call screen" />
+        </service>
+
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

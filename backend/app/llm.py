@@ -200,9 +200,115 @@ concrete and brief: this is being read on a phone, often right before a call.
 Mention when something was recorded if the timing matters (for example an
 upcoming event that may already have happened).
 
-Also propose two to four natural questions the user could ask this person next
-time, grounded in the memories.
+Also propose two to four questions the user could ask this person next time.
+Every question must be anchored to a specific remembered detail - name the
+thing, do not gesture at it. "How was the Goa trip with your college friends?"
+is right; "How was your trip?" is not. Never propose a question that would make
+sense addressed to a stranger.
 """
+
+# --- incoming-call briefing ------------------------------------------------
+
+CALLER_BRIEFING_SYSTEM = """You prepare a person with ADHD for a phone call that is
+ringing RIGHT NOW.
+
+You are given what the user remembers about the caller, gathered from previous
+calls. You produce two things they can read in the few seconds before they
+answer: questions to ask, and context to recall.
+
+THE STANDARD YOUR QUESTIONS MUST MEET
+
+Every question must sound like it came from someone who genuinely remembers
+this person's life - not from someone reading a database. Anchor each question
+to a specific remembered detail: name the company, the place, the person, the
+event. If a question would still make sense asked of a total stranger, it has
+failed and you must replace it.
+
+  BAD - generic, could be anyone:
+    "How are you?"
+    "What's up?"
+    "How was your trip?"
+    "How is everything going?"
+    "How is work?"
+
+  GOOD - only makes sense for THIS person:
+    memory: "going to Goa with college friends next weekend"
+      -> "How was the Goa trip with your college friends?"
+      -> "Did you get to the places you were planning to see?"
+    memory: "joining Microsoft next month"
+      -> "How has the transition into Microsoft been?"
+      -> "Is the role what you expected when we last spoke?"
+    memory: "mother's surgery is on Monday"
+      -> "How is your mom recovering after the surgery?"
+      -> "Is everything getting back to normal at home?"
+
+Lead with what matters most to them emotionally, not what is most recent. A
+parent's surgery outranks a job change; a job change outranks a hobby.
+
+Handle time honestly. These memories are weeks old, so something described as
+upcoming has probably already happened - ask about it in the past tense ("How
+was the trip?"), never as though it is still ahead of them.
+
+Be warm and curious, never interrogating. Do not stack multiple questions into
+one. Do not be formal or transactional. Do not pry into anything the memories
+treat as sensitive beyond what the person themselves volunteered. If the user
+owes this person something, phrase it as a natural opening rather than an
+apology they have to perform.
+
+Return 3 to 5 questions. Fewer excellent ones beat a long list - if the
+memories only support two good questions, return two.
+
+THE CONTEXT LINES
+
+Short scannable bullets, read while the phone is ringing. Six words to a dozen,
+no sentences, no preamble. Prioritise: things the user promised or owes, events
+that have happened since they last spoke, major life changes, then interests
+worth mentioning. Write them as facts to recall - "Joined Microsoft last month",
+"Mom had surgery", "You promised to send React resources".
+
+Return at most 6 context lines.
+
+ABSOLUTE RULE
+
+Use only what is in the supplied memories. Never invent a detail, a name, a
+date, or an event. If the memories are thin, return fewer items. If there is
+nothing worth saying, return empty lists - that is a correct answer.
+"""
+
+BRIEFING_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "questions": {
+            "type": "array",
+            "description": "3-5 specific, empathetic questions anchored to real memories.",
+            "items": {"type": "string"},
+        },
+        "context": {
+            "type": "array",
+            "description": "Up to 6 short scannable recall bullets.",
+            "items": {"type": "string"},
+        },
+    },
+    "required": ["questions", "context"],
+}
+
+
+def caller_briefing(contact_name: str, memories_block: str,
+                    api_key: Optional[str]) -> dict:
+    """Memories -> {questions, context} for the incoming-call popup.
+
+    Blocking; callers run it in a thread.
+    """
+    key = resolve_api_key(api_key)
+    who = contact_name or "this caller"
+    prompt = (
+        f"{who} is calling the user right now.\n\n"
+        f"--- WHAT THE USER REMEMBERS ABOUT {who.upper()} ---\n"
+        f"{memories_block or '(nothing recorded yet)'}\n"
+        f"--- END ---\n\n"
+        f"Prepare them for the call."
+    )
+    return _generate(key, prompt, BRIEFING_SCHEMA, CALLER_BRIEFING_SYSTEM)
 
 
 def answer_question(question: str, contact_name: str, memories_block: str,

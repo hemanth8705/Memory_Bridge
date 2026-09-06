@@ -11,3 +11,6 @@ pydantic==2.13.5
 # Pulls in ctranslate2 (inference) and av/PyAV (audio decode - bundles its
 # own ffmpeg, no system ffmpeg needed).
 faster-whisper==1.2.1
+
+
+actian-vectorai-client

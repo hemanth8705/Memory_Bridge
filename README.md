@@ -33,6 +33,7 @@ backend/          FastAPI + MongoDB + Gemini
     check_mongo.py          standalone MONGODB_URL connectivity + write check
     check_gemini_models.py  confirms a Gemini key + which flash models it can call
     check_recorded_at.py    regression test for the "last conversation" timestamp fix
+    check_caller_popup.py   asserts the contract the native call popup depends on
     cleanup_test_data.py    removes the throwaway contact check_recorded_at.py creates
 mobile/           Flutter app (Android)
   assets/icon/      logo.png (legacy icon), logo_foreground.png (padded adaptive icon)
@@ -40,7 +41,16 @@ mobile/           Flutter app (Android)
     services/config_service.dart      backend URL / Gemini key / folder
     services/api_service.dart         backend client + job polling
     services/recording_scanner.dart   folder scan, hashing, caller ID
-    screens/                          setup, dashboard, contact, ask
+    services/call_popup_service.dart  MethodChannel bridge to the native popup
+    screens/                          setup, dashboard, contact, ask, call popup
+  android/.../kotlin/
+    CallReceiver.kt         PHONE_STATE receiver -> incoming number
+    CallerPopupService.kt   fetches the briefing, draws the overlay card
+    NativeConfig.kt         backend URL/key mirrored out of Dart
+    MainActivity.kt         MethodChannel + call/overlay permission requests
+  android/.../res/layout/
+    popup_caller.xml        the floating card
+    popup_bullet.xml        one QUESTIONS / CONTEXT line
 ```
 
 ---
@@ -225,7 +235,8 @@ of its own:
 
 - **Backend URL** — the ngrok or LAN address.
 - **Gemini API key** — the user's own, sent per request as `X-Gemini-Api-Key`.
-- **Recording folder** — **Auto-detect** probes ~15 known recorder folders; **Browse** opens the
+- **Recording folder** — **Auto-detect** probes ~16 known recorder folders (including
+  `/storage/emulated/0/sound_recorder/call_rec`); **Browse** opens the
   system picker; or type a path like `/storage/emulated/0/Recordings/Call`.
 
 **Test connection** verifies the backend and reports whether MongoDB is actually writable, so
@@ -238,6 +249,81 @@ setup problems surface before the demo rather than during it.
 access is a deliberate hackathon choice — it is reliable across recorder apps, and would not
 pass Play Store review.
 
+The incoming-call popup adds `READ_PHONE_STATE`, `READ_CALL_LOG` and `SYSTEM_ALERT_WINDOW`,
+all requested from its own screen with an explanation first — see below.
+
+---
+
+## Incoming-call context popup
+
+When someone calls, a card floats over the call screen showing **QUESTIONS** worth asking and
+**CONTEXT** worth recalling, drawn from that person's existing memories. It appears while the
+phone rings and stays up during the call, since that is when the context is actually useful.
+
+Set it up from **Dashboard → phone icon**, or **Setup → Incoming call popup**. Both permissions
+are explained before any system dialog appears, and the popup is off until you switch it on.
+There is a **Preview with a number** button so you can see the real card without waiting for
+someone to call.
+
+### How it is wired
+
+```
+PHONE_STATE broadcast (RINGING)
+        ↓  CallReceiver.kt        native, manifest-registered
+phone number
+        ↓  CallerPopupService.kt  foreground service
+POST /callers/lookup {phone_number}
+        ↓  backend: match phone_key → memories → Gemini
+{questions[], context[]}
+        ↓
+WindowManager overlay card
+```
+
+It is Android-native (Kotlin) rather than Flutter, because a call usually arrives when the app
+is backgrounded or killed, and there is no Flutter engine running to draw anything. The card is
+a `WindowManager` overlay, not an activity: `FLAG_NOT_FOCUSABLE` and `FLAG_NOT_TOUCH_MODAL` mean
+it never steals focus and taps outside it fall through — **you can still answer the call with
+the card on screen.** It dismisses on ✕ or when the call ends.
+
+### Permissions, and why each is needed
+
+| Permission | Why |
+| --- | --- |
+| `READ_PHONE_STATE` | Delivers the call-state broadcast — how we know the phone is ringing. |
+| `READ_CALL_LOG` | Since Android 9 the caller's **number** is only included in that broadcast if this is also granted. Without it we know a call is happening but not who it is. |
+| `SYSTEM_ALERT_WINDOW` | Draws the card over the system call screen. |
+
+`READ_CALL_LOG` is restricted on the Play Store; this is fine for a sideloaded hackathon build,
+and is the same approach caller-ID apps use.
+
+### It never blocks the call
+
+Every failure degrades to something still useful, and the `degraded` field in the response says
+which case fired:
+
+| Situation | What the card shows |
+| --- | --- |
+| Known caller, memories exist | Name + questions + context |
+| Known caller, nothing recorded yet | Name + *"No previous memories found. Start a conversation naturally."* |
+| Number not in the database | Number + *"Unknown contact / No relationship context available."* |
+| Gemini unreachable | Name + context bullets taken straight from stored memory rows, no questions |
+| Backend unreachable or timed out | Number + a one-line reason |
+| Backend URL not configured | Number + a prompt to finish setup |
+
+`scripts/check_caller_popup.py` replays the exact request the Kotlin service makes and asserts
+every field its parser reads, including the known/unknown/blank-number paths — so a backend
+change that would break the popup fails there rather than during a real call.
+
+### Question quality
+
+The questions come from a dedicated prompt (`CALLER_BRIEFING_SYSTEM` in `app/llm.py`) whose
+whole job is to sound like someone who remembers this person, not someone reading a database.
+It requires every question to be anchored to a specific remembered detail — "How was the Goa
+trip with your college friends?", never "How was your trip?" — orders them by emotional weight
+(a parent's surgery outranks a job change), and asks about now-past events in the past tense,
+since the memories are typically weeks old. It returns 3–5 questions and at most 6 context
+lines, and is instructed to return fewer rather than pad.
+
 ---
 
 ## How a recording becomes a memory
@@ -247,6 +333,22 @@ pass Play Store review.
    contacts. Numbers are normalised to their last 10 digits, so `+919876543210`, `09876543210`
    and `9876543210` all resolve to one person. Name-based filenames like
    `Rahul_call_2026_08_01.mp3` fall back to a name guess.
+
+   **The phone number is the linking identifier** across the whole system — recording filename,
+   device contact list, database, and incoming call all normalise the same way, so the same
+   person resolves identically no matter which direction they arrive from. The Dart and Python
+   parsers are deliberate mirrors of each other (`recording_scanner.dart` ↔ `app/contacts.py`),
+   and both test suites assert the same cases.
+
+   The device recorder's own format is recognised directly:
+
+   ```
+   Vaibhav Singh @ CI(08700648603)_20260906131241.mp3
+   └─ contact name ─┘ └─ number ─┘ └─ YYYYMMDDHHMMSS ─┘
+
+   08920474604(08920474604)_20260906134028.mp3
+   └ number repeated as the name when the caller is unknown → treated as no name
+   ```
 3. **Deduplicate** — each file gets `SHA-256(filename + size + mtime)`. `POST /recordings/check`
    returns only what the backend has not already processed, so nothing is ever transcribed
    twice. Previously *failed* recordings are offered again.
@@ -282,9 +384,9 @@ an offset-less string as *local* time — skewing every relative-time display by
 offset. This was a real, previously-undetected bug affecting every timestamp in the app, not only
 `last_conversation_at`.
 
-**Not yet done:** deriving `recorded_at` from a timestamp embedded in the filename itself (more
-reliable than file mtime, which drifts if a recording is later copied/synced) — pending a real
-sample filename to build the parser against, rather than guessing the date format.
+`recorded_at` is resolved most-trustworthy-first: **a timestamp embedded in the filename** by the
+recorder, then the file's mtime, then now. The filename wins because mtime resets whenever a
+recording is copied or synced, while the name travels with the file.
 
 Collections: `recordings`, `transcripts`, `contacts`, `memories`, `jobs`.
 
@@ -302,6 +404,7 @@ Collections: `recordings`, `transcripts`, `contacts`, `memories`, `jobs`.
 | `GET /contacts` | People, most recently spoken to first |
 | `GET /contacts/{id}/memories` | Memories grouped by type, topics, conversations |
 | `POST /memory/search` | `{contact_id, query}` → grounded answer + suggested questions |
+| `POST /callers/lookup` | `{phone_number}` → `{contact_name, questions[], context[], degraded}` for the incoming-call popup. One round trip, because the phone only rings for ~25s. |
 
 The Gemini key travels on the `X-Gemini-Api-Key` header for the two endpoints that need it.
 
@@ -336,3 +439,11 @@ Step 6 is worth showing: it is the difference between a demo and a system.
   ~40s call in testing here). A real device or a smaller phone-side CPU will be slower — that is
   why processing is a polled background job rather than a held-open request. If a demo call runs
   long, `STT_MODEL=tiny` trades some accuracy for speed.
+- The call popup needs the backend reachable *at the moment the phone rings*. If ngrok is down it
+  degrades to showing the caller only — it never blocks or delays the call, but there is no
+  offline cache of briefings yet.
+- The popup's questions are generated fresh on every call. Caching the last briefing per contact
+  would make it instant on a repeat call, and is the obvious next optimisation.
+- Some OEM battery managers (Xiaomi, Oppo, Vivo especially) kill manifest-registered receivers
+  for apps that are not exempted from battery optimisation. If the popup does not appear on a
+  device like that, allow MemoryBridge to run in the background in system settings.

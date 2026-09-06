@@ -8,6 +8,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from datetime import datetime, timezone  # noqa: E402
+
 from app import asr, contacts, pipeline  # noqa: E402
 
 failures: list[str] = []
@@ -30,9 +32,28 @@ cases = [
     ("Rahul_call_2026_08_01.mp3", None),
     ("20260801_103000.mp3", None),
     ("voice_memo.m4a", None),
+    # The actual on-device recorder format: name(number)_YYYYMMDDHHMMSS
+    ("Vaibhav Singh @ CI(08700648603)_20260906131241.mp3", "08700648603"),
+    ("08920474604(08920474604)_20260906134028.mp3", "08920474604"),
 ]
 for filename, want in cases:
     check(filename, contacts.extract_phone_number(filename), want)
+
+print("\n[1b] call timestamp read from the filename, not the file's mtime")
+check(
+    "Vaibhav Singh @ CI(08700648603)_20260906131241.mp3",
+    contacts.extract_recorded_at("Vaibhav Singh @ CI(08700648603)_20260906131241.mp3"),
+    datetime(2026, 9, 6, 13, 12, 41, tzinfo=timezone.utc),
+)
+check(
+    "08920474604(08920474604)_20260906134028.mp3",
+    contacts.extract_recorded_at("08920474604(08920474604)_20260906134028.mp3"),
+    datetime(2026, 9, 6, 13, 40, 28, tzinfo=timezone.utc),
+)
+check("no timestamp in filename -> None",
+      contacts.extract_recorded_at("Rahul_call_2026_08_01.mp3"), None)
+check("impossible date -> None (not a crash)",
+      contacts.extract_recorded_at("X(919876543210)_20261399999999.mp3"), None)
 
 print("\n[2] number normalisation (same person across formats)")
 keys = {contacts.normalize_phone(n) for n in
@@ -43,6 +64,13 @@ check("key is last 10 digits", keys.pop(), "9876543210")
 print("\n[3] name fallback for name-based filenames")
 check("Rahul_call_2026_08_01.mp3", contacts.guess_name("Rahul_call_2026_08_01.mp3"), "Rahul")
 check("Call recording Sarah.m4a", contacts.guess_name("Call recording Sarah.m4a"), "Sarah")
+check("name before the bracket is kept",
+      contacts.guess_name("Vaibhav Singh @ CI(08700648603)_20260906131241.mp3"),
+      "Vaibhav Singh @ CI")
+check("number repeated as the name is NOT a name",
+      contacts.guess_name("08920474604(08920474604)_20260906134028.mp3"), None)
+check("digits-only filename leaves no name, not punctuation",
+      contacts.guess_name("Call_+919876543210_20260801_103000.mp3"), None)
 
 print("\n[4] identify() precedence - device contact beats filename")
 ident = contacts.identify("Call_+919876543210_20260801.mp3", "+919876543210", "Rahul Sharma")

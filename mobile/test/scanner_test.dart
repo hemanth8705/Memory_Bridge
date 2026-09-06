@@ -27,6 +27,47 @@ void main() {
       expect(RecordingScanner.extractPhoneNumber('Rahul_call_2026_08_01.mp3'), isNull);
       expect(RecordingScanner.extractPhoneNumber('voice_memo.m4a'), isNull);
     });
+
+    test('reads the device recorder format: name(number)_timestamp', () {
+      expect(
+        RecordingScanner.extractPhoneNumber(
+            'Vaibhav Singh @ CI(08700648603)_20260906131241.mp3'),
+        '08700648603',
+      );
+      expect(
+        RecordingScanner.extractPhoneNumber(
+            '08920474604(08920474604)_20260906134028.mp3'),
+        '08920474604',
+      );
+    });
+  });
+
+  group('call timestamp from the filename (beats file mtime)', () {
+    test('parses YYYYMMDDHHMMSS after the number', () {
+      expect(
+        RecordingScanner.extractRecordedAt(
+            'Vaibhav Singh @ CI(08700648603)_20260906131241.mp3'),
+        DateTime(2026, 9, 6, 13, 12, 41),
+      );
+      expect(
+        RecordingScanner.extractRecordedAt(
+            '08920474604(08920474604)_20260906134028.mp3'),
+        DateTime(2026, 9, 6, 13, 40, 28),
+      );
+    });
+
+    test('returns null when there is no timestamp to read', () {
+      expect(RecordingScanner.extractRecordedAt('Rahul_call_2026_08_01.mp3'), isNull);
+      expect(RecordingScanner.extractRecordedAt('voice_memo.m4a'), isNull);
+    });
+
+    test('rejects an impossible date instead of rolling it over', () {
+      // DateTime would silently turn month 13 into January of the next year.
+      expect(
+        RecordingScanner.extractRecordedAt('X(919876543210)_20261340993000.mp3'),
+        isNull,
+      );
+    });
   });
 
   group('number normalisation', () {
@@ -57,6 +98,47 @@ void main() {
 
     test('returns null when there is nothing name-like left', () {
       expect(RecordingScanner.guessName('call_recording_001.mp3'), isNull);
+    });
+
+    test('keeps the name before the bracket verbatim', () {
+      expect(
+        RecordingScanner.guessName(
+            'Vaibhav Singh @ CI(08700648603)_20260906131241.mp3'),
+        'Vaibhav Singh @ CI',
+      );
+    });
+
+    test('a number repeated as the name is not a name', () {
+      expect(
+        RecordingScanner.guessName('08920474604(08920474604)_20260906134028.mp3'),
+        isNull,
+      );
+    });
+
+    test('a digits-only filename yields no name, not punctuation', () {
+      // Used to return "+" after digits were stripped.
+      expect(
+        RecordingScanner.guessName('Call_+919876543210_20260801_103000.mp3'),
+        isNull,
+      );
+    });
+  });
+
+  group('phone-number linking is consistent across the whole chain', () {
+    test('recording filename, contact list and incoming call agree', () {
+      // The recorder writes 08700648603; the address book and the incoming
+      // call may present the same person very differently. All must collapse
+      // to one key or the popup will not find their memories.
+      final fromRecording = RecordingScanner.normalizePhone(
+        RecordingScanner.extractPhoneNumber(
+            'Vaibhav Singh @ CI(08700648603)_20260906131241.mp3'),
+      );
+      final fromContacts = RecordingScanner.normalizePhone('+91 87006 48603');
+      final fromIncomingCall = RecordingScanner.normalizePhone('+918700648603');
+
+      expect(fromRecording, '8700648603');
+      expect(fromContacts, fromRecording);
+      expect(fromIncomingCall, fromRecording);
     });
   });
 

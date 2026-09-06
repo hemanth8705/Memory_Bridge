@@ -1,13 +1,16 @@
 """Contacts, their memories, and question answering over them."""
 import asyncio
+import logging
 from typing import Optional
 
 from bson import ObjectId
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
-from .. import llm
+from .. import contacts as contacts_mod, llm
 from ..db import get_db
+
+log = logging.getLogger("memorybridge.contacts")
 
 router = APIRouter()
 
@@ -157,3 +160,114 @@ async def search_memory(
         "suggested_questions": result.get("suggested_questions", []),
         "memories_considered": len(memories),
     }
+
+
+# --- incoming-call briefing -------------------------------------------------
+
+class CallerLookupRequest(BaseModel):
+    phone_number: str
+
+
+# Read while the phone is ringing, so the most conversationally useful kinds
+# of memory go in front of the model first.
+_BRIEFING_PRIORITY = [
+    "promise", "follow_up", "important_date", "health", "family",
+    "job", "travel", "study", "event", "interest", "personal", "other",
+]
+
+# Enough to brief well, few enough to keep the Gemini call fast.
+_BRIEFING_MEMORY_LIMIT = 40
+
+
+def _fallback_context(memories: list[dict]) -> list[str]:
+    """Context bullets straight from the stored memory rows.
+
+    Used when Gemini is unreachable or errors - the popup still shows real
+    recall material instead of an empty card.
+    """
+    ordered = sorted(
+        memories,
+        key=lambda m: _BRIEFING_PRIORITY.index(m.get("type", "other"))
+        if m.get("type", "other") in _BRIEFING_PRIORITY else len(_BRIEFING_PRIORITY),
+    )
+    return [m["content"] for m in ordered[:6] if m.get("content")]
+
+
+@router.post("/callers/lookup")
+async def caller_lookup(
+    payload: CallerLookupRequest,
+    x_gemini_api_key: Optional[str] = Header(None, alias="X-Gemini-Api-Key"),
+):
+    """Incoming phone number -> what to say to them.
+
+    Single round trip for the call popup: match the number to a contact, pull
+    their memories, and turn those into questions + context. Degrades in
+    stages rather than failing - an unknown number, a known contact with no
+    memories, and an unreachable Gemini each return a usable payload.
+    """
+    db = get_db()
+    raw = (payload.phone_number or "").strip()
+    key = contacts_mod.normalize_phone(raw)
+
+    base = {
+        "phone_number": raw,
+        "found": False,
+        "contact_id": None,
+        "contact_name": None,
+        "questions": [],
+        "context": [],
+        "memories_considered": 0,
+        "degraded": None,
+    }
+
+    if not key:
+        return {**base, "degraded": "unparseable_number"}
+
+    contact = await db.contacts.find_one({"phone_key": key})
+    if contact is None:
+        # Unknown caller - the popup shows the number and says so.
+        return {**base, "degraded": "contact_not_found"}
+
+    contact_id = str(contact["_id"])
+    name = contact.get("name") or raw
+    base.update({"found": True, "contact_id": contact_id, "contact_name": name})
+
+    memories = []
+    async for doc in db.memories.find({"contact_id": contact_id}).sort("created_at", -1):
+        doc.pop("_id", None)
+        memories.append(doc)
+
+    conversations = []
+    async for doc in db.recordings.find(
+        {"contact_id": contact_id, "status": "completed"}
+    ).sort("recorded_at", -1).limit(20):
+        conversations.append(doc)
+
+    if not memories and not conversations:
+        # Known person, nothing remembered yet.
+        return {**base, "degraded": "no_memories"}
+
+    ordered = sorted(
+        memories,
+        key=lambda m: _BRIEFING_PRIORITY.index(m.get("type", "other"))
+        if m.get("type", "other") in _BRIEFING_PRIORITY else len(_BRIEFING_PRIORITY),
+    )[:_BRIEFING_MEMORY_LIMIT]
+    block = _memories_block(ordered, conversations)
+    base["memories_considered"] = len(ordered)
+
+    try:
+        result = await asyncio.to_thread(
+            llm.caller_briefing, name, block, x_gemini_api_key
+        )
+    except Exception as exc:
+        # The phone is ringing - never fail the popup over the LLM. Fall back
+        # to raw memory rows as context, with no questions.
+        log.warning("caller_briefing failed for %s: %s", name, exc)
+        return {**base, "context": _fallback_context(ordered), "degraded": "llm_unavailable"}
+
+    questions = [q for q in (result.get("questions") or []) if q and q.strip()]
+    context = [c for c in (result.get("context") or []) if c and c.strip()]
+    if not context:
+        context = _fallback_context(ordered)
+
+    return {**base, "questions": questions[:5], "context": context[:6]}

@@ -9,6 +9,21 @@ import re
 from datetime import datetime, timezone
 from typing import Optional
 
+# The device's own recorder format, checked first because it is unambiguous:
+#   Vaibhav Singh @ CI(08700648603)_20260906131241.mp3
+#   08920474604(08920474604)_20260906134028.mp3
+# -> name before the bracket, number inside it, YYYYMMDDHHMMSS after the "_".
+# When the caller is not in contacts the recorder repeats the number as the
+# name, so a "name" that is really just the number is treated as no name.
+_BRACKETED_RE = re.compile(
+    r"^(?P<name>.*?)\((?P<number>\+?[\d\s\-]{6,17}\d)\)_(?P<stamp>\d{14})$"
+)
+
+# Same shape but without the trailing timestamp, for recorders that omit it.
+_BRACKETED_NO_STAMP_RE = re.compile(
+    r"^(?P<name>.*?)\((?P<number>\+?[\d\s\-]{6,17}\d)\)"
+)
+
 # Matches the number-ish run inside names like:
 #   Call_+919876543210_20260801_103000.mp3
 #   919876543210_20260801.mp3
@@ -38,9 +53,41 @@ def normalize_phone(raw: Optional[str]) -> Optional[str]:
     return digits[-10:] if len(digits) >= 10 else digits
 
 
+def _bracketed(filename: str):
+    """Match the device recorder's name(number)_timestamp shape."""
+    stem = filename.rsplit(".", 1)[0]
+    return _BRACKETED_RE.match(stem) or _BRACKETED_NO_STAMP_RE.match(stem)
+
+
+def extract_recorded_at(filename: str) -> Optional[datetime]:
+    """The call's own timestamp, straight out of the filename.
+
+    More trustworthy than the file's mtime, which resets whenever a recording
+    is copied or synced. Naive local wall-clock in the filename, so it is read
+    as UTC - close enough for relative "3 weeks ago" display, and consistent
+    with how the rest of the pipeline stores times.
+    """
+    match = _BRACKETED_RE.match(filename.rsplit(".", 1)[0])
+    if not match:
+        return None
+    try:
+        parsed = datetime.strptime(match.group("stamp"), "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=timezone.utc)
+
+
 def extract_phone_number(filename: str) -> Optional[str]:
     """Pull a phone number out of a recording filename, if there is one."""
     stem = filename.rsplit(".", 1)[0]
+
+    bracketed = _bracketed(filename)
+    if bracketed:
+        cleaned = re.sub(r"[\s\-]", "", bracketed.group("number"))
+        bare = cleaned.lstrip("+")
+        if 7 <= len(bare) <= 15:
+            return cleaned
+
     for candidate in _PHONE_RE.findall(stem):
         cleaned = re.sub(r"[\s\-()]", "", candidate)
         bare = cleaned.lstrip("+")
@@ -54,6 +101,15 @@ def extract_phone_number(filename: str) -> Optional[str]:
 
 def guess_name(filename: str) -> Optional[str]:
     """Fallback for name-based filenames like 'Rahul_call_2026_08_01.mp3'."""
+    bracketed = _bracketed(filename)
+    if bracketed:
+        # "Vaibhav Singh @ CI(0870...)" -> "Vaibhav Singh @ CI".
+        # "08920474604(08920474604)"    -> not a name, just the number again.
+        candidate = bracketed.group("name").strip(" _-")
+        if candidate and normalize_phone(candidate) is None:
+            return candidate
+        return None
+
     stem = filename.rsplit(".", 1)[0]
     stem = re.sub(r"[_\-]+", " ", stem)
     stem = re.sub(r"\d+", " ", stem)
@@ -61,7 +117,11 @@ def guess_name(filename: str) -> Optional[str]:
     if not words:
         return None
     name = " ".join(words[:3]).strip()
-    return name.title() if name else None
+    # A number-based filename leaves only punctuation behind ("+919..." -> "+").
+    # That is not a name.
+    if not any(ch.isalpha() for ch in name):
+        return None
+    return name.title()
 
 
 def identify(filename: str, phone_number: Optional[str] = None,
